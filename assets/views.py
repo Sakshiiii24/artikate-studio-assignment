@@ -1,16 +1,32 @@
+from datetime import timedelta
 from django.db import connection, transaction
+from django.db.models import (
+    Avg,
+    Count,
+    DurationField,
+    ExpressionWrapper,
+    F,
+    Prefetch,
+    Q,
+    Value,
+)
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from assets.models import Asset, Employee, CheckOut
 from assets.serializers import (
+    AssetSerializer,
+    AssetDetailSerializer,
     CheckOutSerializer,
     CheckOutCreateSerializer,
     CheckOutReturnSerializer,
+    EmployeeSummarySerializer,
+    OverdueReportSerializer,
 )
 
 
@@ -44,6 +60,78 @@ def health_check(request):
     return Response(payload, status=status.HTTP_200_OK)
 
 
+class AssetListCreateView(APIView):
+    """
+    GET  /api/v1/assets/ - List assets with pagination, status/category filter, and search.
+    POST /api/v1/assets/ - Create a new asset.
+    """
+    permission_classes = [IsAuthenticated]
+    pagination_class = PageNumberPagination
+
+    def get(self, request):
+        queryset = Asset.objects.all().order_by('id')
+
+        # Filter by status
+        status_filter = request.query_params.get('status')
+        if status_filter:
+            queryset = queryset.filter(status=status_filter.upper())
+
+        # Filter by category
+        category_filter = request.query_params.get('category')
+        if category_filter:
+            queryset = queryset.filter(category=category_filter.upper())
+
+        # Search across name or asset_tag
+        search_query = request.query_params.get('search')
+        if search_query:
+            queryset = queryset.filter(
+                Q(name__icontains=search_query) | Q(asset_tag__icontains=search_query)
+            )
+
+        paginator = self.pagination_class()
+        page = paginator.paginate_queryset(queryset, request)
+        if page is not None:
+            serializer = AssetSerializer(page, many=True)
+            return paginator.get_paginated_response(serializer.data)
+
+        serializer = AssetSerializer(queryset, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def post(self, request):
+        serializer = AssetSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class AssetDetailView(APIView):
+    """
+    GET /api/v1/assets/{id}/
+    Retrieve asset details including current_holder (employee code and name) without N+1 queries.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        try:
+            # Prefetch the single active checkout with related employee to prevent N+1 queries
+            asset = Asset.objects.prefetch_related(
+                Prefetch(
+                    'checkouts',
+                    queryset=CheckOut.objects.filter(returned_at__isnull=True).select_related('employee'),
+                    to_attr='active_checkouts',
+                )
+            ).get(pk=pk)
+        except Asset.DoesNotExist:
+            return Response(
+                {"detail": f"Asset with ID {pk} not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        serializer = AssetDetailSerializer(asset)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
 class CheckOutCreateView(APIView):
     """
     POST /api/v1/checkouts/
@@ -61,10 +149,8 @@ class CheckOutCreateView(APIView):
         employee_code = serializer.validated_data['employee_code']
         due_at = serializer.validated_data['due_at']
 
-        # Enforce concurrency-safe validation and record creation inside an atomic block
         with transaction.atomic():
-            # 1. Consistent Lock Ordering - Lock Employee row first
-            # Rule 8: Unknown employee_code => 404 Not Found
+            # 1. Lock Employee row first (deadlock prevention hierarchy)
             try:
                 employee = Employee.objects.select_for_update().get(employee_code=employee_code)
             except Employee.DoesNotExist:
@@ -73,8 +159,7 @@ class CheckOutCreateView(APIView):
                     status=status.HTTP_404_NOT_FOUND,
                 )
 
-            # 2. Consistent Lock Ordering - Lock Asset row second
-            # Rule 8: Unknown asset_tag => 404 Not Found
+            # 2. Lock Asset row second
             try:
                 asset = Asset.objects.select_for_update().get(asset_tag=asset_tag)
             except Asset.DoesNotExist:
@@ -97,8 +182,7 @@ class CheckOutCreateView(APIView):
                     status=status.HTTP_409_CONFLICT,
                 )
 
-            # Rule 3: Employee may hold at most 3 open check-outs (returned_at is null)
-            # A fourth attempt => 409 Conflict
+            # Rule 3: Employee may hold at most 3 open checkouts
             open_count = CheckOut.objects.filter(
                 employee=employee,
                 returned_at__isnull=True,
@@ -164,7 +248,7 @@ class CheckOutReturnView(APIView):
                 checkout.condition_note = condition_note
             checkout.save(update_fields=['returned_at', 'condition_note'])
 
-            # Update asset status: MAINTENANCE if flagged, else AVAILABLE
+            # Update asset status
             if needs_maintenance:
                 asset.status = Asset.Status.MAINTENANCE
             else:
@@ -173,3 +257,93 @@ class CheckOutReturnView(APIView):
 
         response_serializer = CheckOutSerializer(checkout)
         return Response(response_serializer.data, status=status.HTTP_200_OK)
+
+
+class EmployeeSummaryView(APIView):
+    """
+    GET /api/v1/employees/{employee_code}/summary/
+    Compute employee checkout metrics in a single database ORM aggregation query without looping in Python.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, employee_code):
+        now = timezone.now()
+
+        # Execute single ORM query computing all four aggregate numbers
+        employee_summary = Employee.objects.filter(employee_code=employee_code).annotate(
+            lifetime_checkout_count=Count('checkouts'),
+            currently_held=Count(
+                'checkouts',
+                filter=Q(checkouts__returned_at__isnull=True),
+            ),
+            currently_overdue=Count(
+                'checkouts',
+                filter=Q(
+                    checkouts__returned_at__isnull=True,
+                    checkouts__due_at__lt=now,
+                ),
+            ),
+            mean_duration=Avg(
+                ExpressionWrapper(
+                    F('checkouts__returned_at') - F('checkouts__checked_out_at'),
+                    output_field=DurationField(),
+                ),
+                filter=Q(checkouts__returned_at__isnull=False),
+            ),
+        ).first()
+
+        if not employee_summary:
+            return Response(
+                {"detail": f"Employee with code '{employee_code}' not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        mean_duration_days = 0.0
+        if employee_summary.mean_duration is not None:
+            mean_duration_days = round(employee_summary.mean_duration.total_seconds() / 86400.0, 2)
+
+        data = {
+            "lifetime_checkout_count": employee_summary.lifetime_checkout_count,
+            "currently_held": employee_summary.currently_held,
+            "currently_overdue": employee_summary.currently_overdue,
+            "mean_hold_duration_days": mean_duration_days,
+        }
+        serializer = EmployeeSummarySerializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class OverdueReportView(APIView):
+    """
+    GET /api/v1/reports/overdue/
+    Paginated report of all open check-outs past their due_at (most overdue first).
+    Uses select_related to eliminate N+1 queries.
+    """
+    permission_classes = [IsAuthenticated]
+    pagination_class = PageNumberPagination
+
+    def get(self, request):
+        now = timezone.now()
+        queryset = (
+            CheckOut.objects.filter(
+                returned_at__isnull=True,
+                due_at__lt=now,
+            )
+            .select_related('asset', 'employee')
+            .annotate(
+                overdue_duration=ExpressionWrapper(
+                    Value(now) - F('due_at'),
+                    output_field=DurationField(),
+                )
+            )
+            .order_by('due_at')
+        )
+
+        paginator = self.pagination_class()
+        page = paginator.paginate_queryset(queryset, request)
+        if page is not None:
+            serializer = OverdueReportSerializer(page, many=True, context={'now': now})
+            return paginator.get_paginated_response(serializer.data)
+
+        serializer = OverdueReportSerializer(queryset, many=True, context={'now': now})
+        return Response(serializer.data, status=status.HTTP_200_OK)

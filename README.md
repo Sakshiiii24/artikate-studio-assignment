@@ -126,14 +126,19 @@ Expected JSON response when database is connected:
     - Locking `Employee` row first is mandatory for the 3-checkout limit: it serializes concurrent checkouts by the same employee across different assets. Without this lock, two simultaneous transactions would both read `open_count = 2`, both pass validation, and commit 4 total open checkouts.
     - Return transactions lock the `CheckOut` row first, verify it has not been returned, and then lock the associated `Asset` row, updating both within `transaction.atomic()`.
 
+12. **Employee Summary Single-Query Aggregation:** The four employee summary metrics (`lifetime_checkout_count`, `currently_held`, `currently_overdue`, and `mean_hold_duration_days`) are resolved entirely inside the database engine in a single query via `Employee.objects.filter(...).annotate(...)` using conditional SQL `FILTER (WHERE ...)` clauses (`Count(filter=...)` and `Avg(filter=...)`). Python only formats the resulting database-computed timedelta into days without loading individual checkout rows.
+13. **N+1 Prevention in Reports & Detail Views:**
+    - `GET /api/v1/reports/overdue/` uses `.select_related('asset', 'employee')` to eagerly join related models, executing a fixed 2 queries (1 count for pagination + 1 data fetch) regardless of the number of rows.
+    - `GET /api/v1/assets/{id}/` prefetches active open checkouts with their related employee (`prefetch_related(Prefetch(...))`) to resolve `current_holder` without additional database queries.
+14. **Overdue Ordering Definition:** "Most overdue first" corresponds to `order_by('due_at')` (ASC), placing the earliest past-due checkouts (those overdue for the greatest number of days) at the top of the report.
+
 ---
 
 ## 5. Known Gaps
 
 1. **Domain Models & Migrations:** Completed in Stage 2 (`assets/models.py` and migration `0001_initial.py`).
 2. **Checkout & Return Business Logic:** Completed in Stage 3 (`POST /api/v1/checkouts/` and `POST /api/v1/checkouts/{id}/return/` with database row-level locking).
-3. **Asset Management Endpoints:** `POST /api/v1/assets/`, `GET /api/v1/assets/` (filtering and search), and `GET /api/v1/assets/{id}/` (with `current_holder`) to be added in next stage.
-4. **Aggregation & Reporting Endpoints:** `GET /api/v1/employees/{code}/summary/` (single-query ORM aggregation) and `GET /api/v1/reports/overdue/` to be implemented in subsequent stage.
-5. **Seed Data Command:** `python manage.py seed_demo_data` to be implemented.
-6. **Celery & Redis:** Asynchronous background task `flag_overdue_checkouts` and Celery Beat scheduler are not yet wired up.
-7. **Docker Stack:** `Dockerfile` and `docker-compose.yml` defining the four services (Django, PostgreSQL, Redis, Celery) will be added in the containerisation phase.
+3. **Asset Management & Reporting Endpoints:** Completed in Stage 4 (`/api/v1/assets/`, `/api/v1/assets/{id}/`, `/api/v1/employees/{code}/summary/`, and `/api/v1/reports/overdue/`).
+4. **Seed Data Command:** `python manage.py seed_demo_data` to be implemented in upcoming stage.
+5. **Celery & Redis:** Asynchronous background task `flag_overdue_checkouts` and Celery Beat scheduler are not yet wired up.
+6. **Docker Stack:** `Dockerfile` and `docker-compose.yml` defining the four services (Django, PostgreSQL, Redis, Celery) will be added in the containerisation phase.
