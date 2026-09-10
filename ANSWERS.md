@@ -789,3 +789,290 @@ The following table compares values directly present in the two 100,000-row benc
 * **Controlled Scale Benchmark:** To observe the optimizer's index transition and buffer behavior under volume, an unlogged 100,000-row benchmark was executed and recorded. This is explicitly an experimental model and NOT the actual 4.2 million-row production dataset. All temporary benchmark tables were cleanly dropped immediately after the measurement.
 * **Final Database State:** The real application database retains only the assessment's clean seed data, the exact required schema, and its original PK/FK migration indexes. No candidate index remains manually created on the real database, and no unmanaged schema changes were left behind.
 
+---
+
+# Part D — Production Engineering, Migrations & CI/CD
+
+This section provides technical reviews and implementation designs for production schema migrations, incident diagnosis, and automated CI/CD deployment pipelines.
+
+---
+
+## D1 — Zero-Downtime Migration: Adding a Non-Null Foreign Key at Scale
+
+### Scenario & Constraints
+* **Table:** `checkouts` (4.2 million rows, active read/write traffic of ~8,000 operations/day).
+* **Objective:** Add a foreign key column `location_id` referencing `locations(id)` that must ultimately be `NOT NULL` and enforced as a foreign key constraint, with **zero downtime**.
+
+---
+
+### 1. Why Doing Everything in One Blocking Migration Fails
+Executing a naive single DDL statement in a live production environment:
+```sql
+-- DANGEROUS: DO NOT EXECUTE ON LIVE PRODUCTION TABLE
+ALTER TABLE checkouts
+    ADD COLUMN location_id bigint NOT NULL REFERENCES locations(id);
+```
+triggers catastrophic failure modes:
+1. **Exclusive Lock Queuing (`ACCESS EXCLUSIVE`):** Adding a column with a foreign key and `NOT NULL` requires an `ACCESS EXCLUSIVE` lock on `checkouts`. While holding this lock, all incoming `SELECT`, `INSERT`, `UPDATE`, and `DELETE` queries on `checkouts` are blocked in PostgreSQL's lock queue.
+2. **Connection Pool Exhaustion & Cascade Outage:** Because incoming HTTP requests cannot acquire database connections while queries wait for the lock, connection pools (e.g., PgBouncer, Django database connections, Gunicorn worker processes) saturate in seconds. Reverse proxies (Nginx/Cloudflare) begin returning `504 Gateway Timeout` errors, causing a total application outage.
+3. **Table Scan Under Lock:** PostgreSQL must validate the foreign key constraint across all 4.2 million rows to ensure every row references a valid `locations(id)`. Validating 4.2 million rows while holding an exclusive lock takes tens of seconds or minutes.
+4. **Instant Integrity Failure:** If the table already contains rows, adding `NOT NULL` without a default value immediately raises an `IntegrityError: column "location_id" contains null values` and rolls back after prolonged lock contention.
+
+---
+
+### 2. Safe Zero-Downtime Migration Sequence (Expand / Contract)
+
+To achieve zero downtime, the migration must be broken into five discrete phases across multiple releases using the **Expand / Contract (Parallel Run)** pattern:
+
+```
+Phase 1 (Expand)       Phase 2 (Dual-Write)    Phase 3 (Backfill)     Phase 4 (Enforce)      Phase 5 (Contract)
+Nullable Column +      App writes both         Background worker      Validate FK +          Model marked NOT NULL;
+Unvalidated FK         old & new schema        backfills historical   Validate NOT NULL      clean legacy paths
+```
+
+#### Step 1: Add Nullable Column with Unvalidated FK Constraint (Pre-Deploy DDL)
+* Run a migration adding the column as **nullable** and without an immediate foreign key table check.
+* Add the foreign key constraint using PostgreSQL's `NOT VALID` clause:
+```sql
+SET lock_timeout = '2s';
+
+-- 1. Add column as nullable (instant in Postgres, metadata-only update)
+ALTER TABLE checkouts ADD COLUMN location_id bigint;
+
+-- 2. Add FK constraint without validating existing rows (enforces on future writes immediately)
+ALTER TABLE checkouts
+    ADD CONSTRAINT fk_checkouts_location
+    FOREIGN KEY (location_id) REFERENCES locations(id)
+    NOT VALID;
+```
+* **Why this is safe:**
+  - Adding a nullable column without a default takes `< 5 ms` (updates `pg_attribute` metadata without rewriting the heap).
+  - `NOT VALID` acquires a brief `SHARE ROW EXCLUSIVE` lock to register the constraint and enforces referential integrity on all **new** writes, but **skips scanning existing rows**.
+  - If lock acquisition takes longer than 2 seconds (e.g. waiting on a concurrent query), `lock_timeout = '2s'` aborts the DDL immediately rather than creating a connection pile-up.
+
+#### Step 2: Deploy Application Code (Dual-Write & Null-Tolerant Reads)
+* Deploy updated application code to the cluster (rolling deployment):
+  - **Writes:** All new checkout creations must now populate `location_id` (e.g. derived from asset's location, employee's assigned warehouse/office, or API payload).
+  - **Reads:** Application code must still tolerate `location_id` being `None` / `NULL` for existing historical checkouts that have not yet been backfilled.
+* **Behavior of Old Code During Rolling Deploy:**
+  - Old application pods do not know about `location_id` and insert rows with `location_id = NULL`. This succeeds without error because the column is nullable.
+  - New application pods insert rows with valid `location_id`, which PostgreSQL validates via the `NOT VALID` foreign key constraint.
+
+#### Step 3: Backfill Historical Data in Controlled Batches
+* Historical rows (~4.2 million records) must have their `location_id` populated using a background batching script (Celery worker, Django management command, or batched SQL):
+```python
+# Batch backfill pattern: bounds memory, prevents long locks, respects replication lag
+def backfill_checkouts_location(batch_size=5000):
+    last_id = 0
+    while True:
+        # Cursor-based batching by Primary Key
+        batch = list(
+            CheckOut.objects.filter(id__gt=last_id, location_id__isnull=True)
+            .order_by("id")[:batch_size]
+            .values_list("id", "asset_id")
+        )
+        if not batch:
+            break
+
+        updates = []
+        for cid, aid in batch:
+            resolved_loc_id = resolve_location(aid)
+            updates.append(CheckOut(id=cid, location_id=resolved_loc_id))
+
+        CheckOut.objects.bulk_update(updates, ["location_id"])
+        last_id = batch[-1][0]
+        time.sleep(0.05)  # Yield CPU and allow replication catch-up
+```
+* **Why this backfill strategy is safe:**
+  - **Cursor-based pagination (`id > last_id`):** Avoids costly `OFFSET` queries that degrade as the backfill progresses.
+  - **Small chunk transactions (5,000 rows):** Each transaction commits in milliseconds, holding row locks briefly and avoiding lock escalation.
+  - **Throttle sleep (`time.sleep(0.05)`):** Prevents disk I/O saturation and gives PostgreSQL write-ahead log (WAL) replication streams time to replicate to read replicas without inducing replication lag.
+
+#### Step 4: Validate Foreign Key & Enforce NOT NULL Concurrently
+* Once the backfill is verified (`SELECT count(*) FROM checkouts WHERE location_id IS NULL;` returns 0):
+```sql
+SET lock_timeout = '2s';
+
+-- 1. Validate FK constraint across all rows without blocking concurrent DML
+ALTER TABLE checkouts VALIDATE CONSTRAINT fk_checkouts_location;
+
+-- 2. Add a NOT NULL check constraint as NOT VALID
+ALTER TABLE checkouts
+    ADD CONSTRAINT check_checkouts_location_not_null
+    CHECK (location_id IS NOT NULL) NOT VALID;
+
+-- 3. Validate NOT NULL check constraint without table lock
+ALTER TABLE checkouts VALIDATE CONSTRAINT check_checkouts_location_not_null;
+```
+* **Why this avoids long locks:**
+  - `VALIDATE CONSTRAINT` takes only a `SHARE UPDATE EXCLUSIVE` lock. Reads, inserts, updates, and deletes continue unhindered while PostgreSQL verifies existing table rows in the background.
+  - In PostgreSQL, validating a `CHECK (col IS NOT NULL)` constraint achieves full non-null data integrity without requiring the table-rewriting `ALTER TABLE ... ALTER COLUMN ... SET NOT NULL` lock.
+
+#### Step 5: Contract (Clean Up Application Code)
+* Update Django model definition to declare `null=False`:
+  ```python
+  location = models.ForeignKey(Location, on_delete=models.PROTECT, null=False)
+  ```
+* Remove temporary fallback/null-handling branches from application code. The schema transition is complete with zero downtime.
+
+---
+
+## D2 — 25-Second API Latency Incident Diagnosis (No Deploy in 9 Days)
+
+### Scenario Context
+An API endpoint that historically responded in under 100 ms suddenly spikes to **25 seconds** consistently. No application code deployment has occurred in the past 9 days.
+
+---
+
+### Cause 1: Database Query Plan Degradation (Planner Drift, Table Bloat, or Lock Queuing)
+
+#### Root Cause Hypothesis
+Under continuous write throughput (~8,000 checkouts/day and ongoing status mutations), 9 days of activity may alter database dynamics. This is strictly a hypothesis, not an asserted root cause: increased table size, dead tuples, stale statistics, or lock contention MAY contribute to the sudden latency spike, and confirmation must come from `pg_stat_activity`, `pg_stat_statements`, `EXPLAIN (ANALYZE, BUFFERS)`, and `pg_stat_user_tables`.
+
+Potential contributing mechanisms include:
+1. **Optimizer Statistics Drift:** PostgreSQL's cost-based query planner relies on `pg_statistic`. If `autovacuum` / `autoanalyze` did not keep pace or table bloat shifted page counts past an optimizer inflection threshold, the planner may flip an access path from an `Index Scan` to a full `Seq Scan` (or from an in-memory `Nested Loop` to an unindexed `Hash Join` spilling to disk). A sequential scan across millions of rows can easily take 20–25 seconds.
+2. **Lock Contention (Blocked by Uncommitted Transaction):** An external cron job, asynchronous report, or long-running database maintenance script may have acquired an exclusive row or table lock (e.g. `pg_dump`, batch updates without index, or an uncommitted transaction in `idle in transaction` state). The API's query stalls in the lock queue until the transaction commits or times out.
+
+#### Concrete Investigation & Verification Steps
+Do not guess. Execute the following inspection sequence directly in PostgreSQL:
+
+1. **Check Active Queries and Wait Events (`pg_stat_activity`):**
+   ```sql
+   SELECT pid, now() - query_start AS duration, state, wait_event_type, wait_event, query
+   FROM pg_stat_activity
+   WHERE state != 'idle'
+   ORDER BY duration DESC;
+   ```
+   - *Confirmation Signal:* If the query is running for 25s with `wait_event_type = 'Lock'`, find the blocking PID using `pg_blocking_pids(pid)`. If `wait_event_type = 'IO'`, disk I/O is saturated.
+2. **Inspect Query Execution History (`pg_stat_statements`):**
+   ```sql
+   SELECT query, calls, mean_exec_time, max_exec_time, rows
+   FROM pg_stat_statements
+   WHERE query ILIKE '%checkouts%'
+   ORDER BY mean_exec_time DESC LIMIT 5;
+   ```
+   - *Confirmation Signal:* If `mean_exec_time` suddenly jumped from 50 ms to 25,000 ms over the past 48 hours.
+3. **Run Live EXPLAIN (ANALYZE, BUFFERS):**
+   - Execute the endpoint's exact SQL query in `psql`.
+   - *Confirmation Signal:* Plan shows a `Seq Scan` reading tens of thousands of disk pages (`Buffers: shared read=...`), or sort spilling to disk (`external merge Disk: ...`).
+4. **Check Table Bloat & Autovacuum Freshness:**
+   ```sql
+   SELECT relname, n_dead_tup, last_vacuum, last_autovacuum, last_analyze, last_autoanalyze
+   FROM pg_stat_user_tables
+   WHERE relname = 'checkouts';
+   ```
+   - *Confirmation Signal:* `n_dead_tup` is abnormally high and `last_autoanalyze` is stale (older than the data surge).
+
+---
+
+### Cause 2: Synchronous External Dependency Timeout / Socket Saturation
+
+#### Root Cause Mechanism
+Modern backend endpoints frequently integrate downstream services:
+- Corporate Single Sign-On / OAuth verification (e.g. Okta, Azure AD).
+- External equipment tracking / inventory vendor API.
+- Synchronous email or SMS notification dispatch inside the HTTP request.
+- Internal microservice or Redis connection pool.
+
+If the endpoint executes a synchronous outbound network call without an aggressive timeout, and the remote provider began experiencing an outage, rate-limiting, or packet drop:
+- The HTTP client (e.g. Python `requests`, `urllib3`, or `gunicorn`) defaults to or is explicitly configured with a **25-second socket timeout** (`timeout=25`).
+- The web process hangs waiting for bytes on the TCP socket until the timeout timer expires, after which it logs a timeout exception or returns a fallback response after exactly 25 seconds.
+
+#### Concrete Investigation & Verification Steps
+1. **APM Distributed Tracing (Datadog / New Relic / OpenTelemetry / Sentry):**
+   - Open trace flame graphs for the 25-second HTTP request.
+   - *Confirmation Signal:* The waterfall trace displays:
+     - `django.view`: 25.01s total duration.
+     - `postgres.query`: 3 ms (rules out the database).
+     - `http.client.request` to `api.external-vendor.com`: **25.00s** (spans entire duration).
+2. **Inspect Application Error Logs & Tracebacks:**
+   - Search centralized logs (ELK / CloudWatch / Datadog) for the endpoint:
+     ```
+     grep "25000" /var/log/gunicorn/access.log
+     ```
+   - *Confirmation Signal:* Look for exceptions occurring at the 25-second mark:
+     `requests.exceptions.ConnectTimeout: HTTPSConnectionPool(host='...', port=443): Max retries exceeded with url ... (Read timed out. (read timeout=25))`
+3. **Host Network & Connection Metrics:**
+   - Run `netstat -s` or `ss -t state syn-sent` on the web hosts to check for dropped SYN packets or hanging TCP sockets.
+   - Inspect DNS resolution latency (e.g., coreDNS or resolver timeouts taking 5s retried 5 times = 25s).
+
+---
+
+## D3 — Production Deployment Pipeline: GitHub Actions PR $\to$ Merge $\to$ Production
+
+A robust, enterprise-grade deployment lifecycle must guarantee that code updates and schema changes never cause downtime, data corruption, or rollback lockups.
+
+```
+[Developer PR] ──> [GitHub Actions CI] ──> [Review & Merge] ──> [Container Build] ──> [Pre-Deploy DDL] ──> [Rolling App Deploy] ──> [Smoke Tests] ──> [Post-Deploy Contract]
+ (Branch)          • Lint & Types          (Merge to main)       • Tag with SHA        (Expand Phase)       (Zero-Downtime)         • Metrics Validated   (Cleanup Phase)
+                   • DB Migration Check                          • Image Scan
+                   • Unit & Integration
+```
+
+---
+
+### 1. Continuous Integration (CI) on Pull Request
+Every pull request triggers a mandatory automated pipeline in GitHub Actions:
+1. **Static Analysis & Formatting:**
+   - Style enforcement: `black --check .`, `isort --check .`, `flake8`.
+   - Static type verification: `mypy .`.
+   - Security scanning: `bandit -r .`, `pip-audit` (checks dependencies against CVE databases).
+2. **Database Migration Verification:**
+   - Missing migrations check: `python manage.py makemigrations --check --dry-run`. Fails CI if a developer altered models without generating a migration.
+   - Migration safety linter: Custom linter or tools like `squawk` to check that new migrations do not contain destructive operations (e.g. unindexed foreign keys, table-rewriting `NOT NULL` additions, or non-concurrent index creation).
+3. **Automated Test Suite:**
+   - Spin up isolated PostgreSQL and Redis service containers in the GitHub Actions runner.
+   - Execute migrations against real PostgreSQL.
+   - Run unit and integration tests with coverage: `pytest --cov=assets --cov-fail-under=85`.
+   - Query count assertion tests: Assert views do not introduce N+1 query regressions (`assertNumQueries`).
+
+---
+
+### 2. Merge to `main` & Artifact Creation
+1. **Branch Protection Rules:**
+   - Direct pushes to `main` are strictly forbidden.
+   - Protect main; require CI and review before merge. Preserve meaningful commit history rather than squashing the assessment's implementation commits.
+2. **Immutable Build Artifact:**
+   - On merge to `main`, GitHub Actions builds a production Docker container.
+   - Tags the image with the exact immutable Git commit SHA: `artikate/web:sha-d662002` (never deploy `:latest` to production).
+   - Scans image for container vulnerabilities using Trivy.
+   - Pushes artifact to the container registry (e.g. AWS ECR / Google Artifact Registry).
+
+---
+
+### 3. Production Deployment Gates & Execution Sequence
+Deployments execute automatically via CD with strict architectural sequencing:
+
+#### Step A: Production Canary / Staging Gate
+* The container artifact is first deployed to a Staging environment mirroring production.
+* Synthetic smoke tests run against health check (`/health/`) and core endpoints to verify connectivity and migrations.
+
+#### Step B: Expand-Contract Migration & Deployment Ordering
+The golden rule of zero-downtime continuous deployment: **The database schema must always be backward-compatible with the currently running application code.**
+
+1. **Pre-Deployment Hook (Database Expand):**
+   - Run database migrations **BEFORE** deploying new application containers.
+   - The migration must be strictly backward-compatible (e.g., adding nullable columns, adding new tables, adding unvalidated constraints).
+   - Old application instances running live traffic continue functioning normally because the schema changes do not alter or remove existing columns.
+2. **Rolling Application Deployment:**
+   - Deploy new container instances using a **rolling update** strategy (e.g. Kubernetes Deployment with `maxSurge: 25%`, `maxUnavailable: 0` or AWS ECS).
+   - New pods boot, pass health checks (`/health/`), and begin receiving live traffic.
+   - Old pods drain active connections and terminate gracefully.
+   - At this point, 100% of live traffic is served by new application code.
+3. **Post-Deployment Tasks (Backfills & Contract):**
+   - Run asynchronous backfill tasks for existing historical records.
+   - Run subsequent contract migration (e.g., validating constraints, dropping obsolete columns) in a later release cycle once old code versions are completely decommissioned.
+
+---
+
+### 4. Rollback Strategy When Schema Has Already Changed
+A common failure mode in CI/CD is a deployment failure where application code must be rolled back, but database migrations have already executed.
+
+#### How Expand-Contract Eliminates Database Rollbacks
+* Because every schema change is deployed as an **Expand** migration (strictly additive and backward-compatible):
+  - **The database does NOT need to be rolled back.**
+  - If the new application version has a critical bug, the deployment pipeline simply rolls the container image back to the previous Git SHA: `artikate/web:sha-previous`.
+  - The previous application version runs cleanly against the expanded database because it simply ignores the new nullable columns or tables.
+* **Why You Should Never Run Automated `down` Migrations in Production:**
+  - Rolling back migrations under live traffic (`python manage.py migrate app <previous_migration>`) often requires destructive locks, drops columns, or deletes data written during the new release window.
+  - Emergency responses must consist of **rolling back application code** to the previous stable artifact, leaving the additive database schema intact, followed by fixing forward.
