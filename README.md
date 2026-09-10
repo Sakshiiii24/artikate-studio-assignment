@@ -39,7 +39,7 @@ The **Field Asset Check-Out Service** is an internal REST API designed to track 
 ### Method A: Running with Docker Compose (Recommended)
 
 #### 1. Build and Start the Services
-Start the 4 core services (`web`, `db` [PostgreSQL 15], `redis`, `worker` [Celery worker]):
+Start the 4 core services (`web`, `db` [PostgreSQL 15], `redis`, `worker` [Celery worker with embedded Beat scheduler]):
 ```bash
 docker compose up --build -d
 ```
@@ -128,6 +128,8 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/artikate_db pytest -v
 14. **Overdue Ordering Definition:** "Most overdue first" corresponds to `order_by('due_at')` (ASC), placing the earliest past-due checkouts (those overdue for the greatest number of days) at the top of the report.
 15. **Deterministic Seed Idempotency:** Because `CheckOut` has no natural unique constraint, the `seed_demo_data` command uses deterministic asset tags and matches existing checkouts by `(asset, employee)` within an atomic transaction. Re-running the command updates timestamps to keep overdue/return statuses current without inflating record counts.
 
+16. **Celery Beat Hourly Schedule & Notice Idempotency:** Celery Beat is scheduled to trigger `assets.tasks.flag_overdue_checkouts` at the top of every hour (`crontab(minute=0)`), run directly within the Celery worker container using embedded Beat (`celery -A config worker -B`). The task scans for open checkouts with `due_at < timezone.now()`. Idempotency is enforced by pre-filtering checkouts that already have an `OverdueNotice` for today's date (`timezone.now().date()`) and performing a bulk insertion with `ignore_conflicts=True`. The database unique constraint `unique_notice_per_checkout_date` on `(checkout, notice_date)` acts as the ultimate concurrency guarantee: if multiple worker processes execute or race simultaneously, duplicate inserts are safely ignored without errors and exactly one notice is recorded per checkout per calendar day.
+
 ---
 
 ## 5. Known Gaps
@@ -137,4 +139,7 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/artikate_db pytest -v
 3. **Asset Management & Reporting Endpoints:** Completed in Stage 4 (`/api/v1/assets/`, `/api/v1/assets/{id}/`, `/api/v1/employees/{code}/summary/`, and `/api/v1/reports/overdue/`).
 4. **Seed Data Command:** Completed in Stage 5 (`python manage.py seed_demo_data`).
 5. **Docker Container Stack:** Completed in Stage 5 (`Dockerfile` and `docker-compose.yml` with `web`, `db`, `redis`, `worker`).
-6. **Celery Overdue Task & Beat:** The Celery worker is configured and running; the asynchronous overdue check task (`flag_overdue_checkouts`) and Celery Beat scheduler will be wired in Stage 6.
+6. **Celery Overdue Task & Beat:** Completed in Stage 6 (`assets/tasks.py` with `flag_overdue_checkouts` and embedded Celery Beat (`-B`) in the worker service, maintaining exactly 4 container services in `docker-compose.yml`).
+7. **Worker-Unavailable & Beat Scheduling Failure Mode (Known Gap):**
+   - **Queue Accumulation During Same-Day Worker Downtime:** If the Celery worker container is stopped, crashing, or backlogged while Celery Beat continues running, Beat continues enqueuing hourly `flag_overdue_checkouts` task messages into the Redis broker. When the worker resumes, it processes the backlog. Because `flag_overdue_checkouts` is protected by the database unique constraint on `(checkout, notice_date)` with `ignore_conflicts=True`, the first task execution creates the notices for the day, and all duplicate runs safely create 0 additional notices without error.
+   - **Multi-Day Worker Outage Gap:** The task stamps notices dynamically using the execution day (`timezone.now().date()`). If the worker service remains down across a calendar day boundary (spanning 24+ hours), no notices are generated for the missed days retroactively. Once restored, the worker will only generate notices stamped with the current calendar date of execution. In a production system, this gap would be resolved by implementing a historical date-range reconciliation / catch-up audit or persisting the last-checked watermark timestamp.

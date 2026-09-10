@@ -126,6 +126,8 @@ STATIC_ROOT = BASE_DIR / 'staticfiles'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # Celery Configuration
+from celery.schedules import crontab
+
 CELERY_BROKER_URL = env('CELERY_BROKER_URL', default='redis://redis:6379/0')
 CELERY_RESULT_BACKEND = env('CELERY_RESULT_BACKEND', default='redis://redis:6379/0')
 CELERY_TIMEZONE = TIME_ZONE
@@ -134,3 +136,11 @@ CELERY_TASK_TIME_LIMIT = 30 * 60
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
+
+# Celery Beat Periodic Task Schedule
+CELERY_BEAT_SCHEDULE = {
+    'flag-overdue-checkouts-hourly': {
+        'task': 'assets.tasks.flag_overdue_checkouts',
+        'schedule': crontab(minute=0),  # Hourly execution at minute 0 of every hour
+    },
+}
