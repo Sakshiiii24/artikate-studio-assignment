@@ -120,14 +120,20 @@ Expected JSON response when database is connected:
 7. **Unique Fields & Indexing:** The specification states `asset_tag` and `employee_code` are unique and indexed. In PostgreSQL and Django, setting `unique=True` on a field inherently creates a unique B-tree index. Specifying `db_index=True` on a unique field is redundant, so `unique=True` was used without an unnecessary duplicate index definition.
 8. **Explicit Database Table Names:** Specified `db_table = 'assets'`, `db_table = 'employees'`, `db_table = 'checkouts'`, and `db_table = 'overdue_notices'` in model `Meta` to match the exact table schema defined in Part C of the assessment specification.
 9. **Notice Uniqueness Constraint:** Enforced via `models.UniqueConstraint(fields=['checkout', 'notice_date'], name='unique_notice_per_checkout_date')` in `Meta.constraints` (modern Django practice preferred over deprecated `unique_together`).
+10. **Authentication Mechanism:** Configured DRF's `BasicAuthentication` and `SessionAuthentication` with `IsAuthenticated` permission class. This provides standards-compliant HTTP authentication without requiring extraneous third-party token migrations at this stage, while `/health/` remains explicitly unauthenticated via `@permission_classes([AllowAny])`.
+11. **Concurrency and Lock Ordering:** To completely prevent deadlocks while ensuring 100% database-level isolation:
+    - Checkout transactions always acquire locks in the strict hierarchical sequence: `Employee` row first, then `Asset` row (`select_for_update()`).
+    - Locking `Employee` row first is mandatory for the 3-checkout limit: it serializes concurrent checkouts by the same employee across different assets. Without this lock, two simultaneous transactions would both read `open_count = 2`, both pass validation, and commit 4 total open checkouts.
+    - Return transactions lock the `CheckOut` row first, verify it has not been returned, and then lock the associated `Asset` row, updating both within `transaction.atomic()`.
 
 ---
 
 ## 5. Known Gaps
 
 1. **Domain Models & Migrations:** Completed in Stage 2 (`assets/models.py` and migration `0001_initial.py`).
-2. **Authentication:** DRF authentication and permission classes are intentionally not yet active across the API.
-3. **Domain Endpoints & Business Logic:** Assets, check-outs, return flow, summary, and overdue reports endpoints are not yet implemented.
-4. **Checkout Concurrency & Limit Rules:** Database-level locking (`select_for_update`) and employee limit checks to be implemented in the checkouts view/service layer in upcoming stages.
-5. **Celery & Redis:** Asynchronous background task `flag_overdue_checkouts` and Celery Beat scheduler are not yet wired up.
-6. **Docker Stack:** `Dockerfile` and `docker-compose.yml` defining the four services (Django, PostgreSQL, Redis, Celery) will be added in the containerisation phase.
+2. **Checkout & Return Business Logic:** Completed in Stage 3 (`POST /api/v1/checkouts/` and `POST /api/v1/checkouts/{id}/return/` with database row-level locking).
+3. **Asset Management Endpoints:** `POST /api/v1/assets/`, `GET /api/v1/assets/` (filtering and search), and `GET /api/v1/assets/{id}/` (with `current_holder`) to be added in next stage.
+4. **Aggregation & Reporting Endpoints:** `GET /api/v1/employees/{code}/summary/` (single-query ORM aggregation) and `GET /api/v1/reports/overdue/` to be implemented in subsequent stage.
+5. **Seed Data Command:** `python manage.py seed_demo_data` to be implemented.
+6. **Celery & Redis:** Asynchronous background task `flag_overdue_checkouts` and Celery Beat scheduler are not yet wired up.
+7. **Docker Stack:** `Dockerfile` and `docker-compose.yml` defining the four services (Django, PostgreSQL, Redis, Celery) will be added in the containerisation phase.
