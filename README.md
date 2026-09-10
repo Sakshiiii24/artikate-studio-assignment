@@ -143,3 +143,15 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/artikate_db pytest -v
 7. **Worker-Unavailable & Beat Scheduling Failure Mode (Known Gap):**
    - **Queue Accumulation During Same-Day Worker Downtime:** If the Celery worker container is stopped, crashing, or backlogged while Celery Beat continues running, Beat continues enqueuing hourly `flag_overdue_checkouts` task messages into the Redis broker. When the worker resumes, it processes the backlog. Because `flag_overdue_checkouts` is protected by the database unique constraint on `(checkout, notice_date)` with `ignore_conflicts=True`, the first task execution creates the notices for the day, and all duplicate runs safely create 0 additional notices without error.
    - **Multi-Day Worker Outage Gap:** The task stamps notices dynamically using the execution day (`timezone.now().date()`). If the worker service remains down across a calendar day boundary (spanning 24+ hours), no notices are generated for the missed days retroactively. Once restored, the worker will only generate notices stamped with the current calendar date of execution. In a production system, this gap would be resolved by implementing a historical date-range reconciliation / catch-up audit or persisting the last-checked watermark timestamp.
+
+---
+
+## 6. Screen Recording
+
+Per assessment submission requirements:
+- **Walkthrough Video Link:** `[Link to Screen Recording (Loom / Drive / unlisted link)]`
+- **Recording Agenda (6–8 minutes):**
+  1. **Stack Initialization:** Bring up the Docker stack (`docker compose up -d`), execute database migrations (`python manage.py migrate`), and seed clean demo data (`python manage.py seed_demo_data`).
+  2. **Live Endpoint Demonstration:** Exercise the check-out flow (`POST /api/v1/checkouts/`), employee hold summary (`GET /api/v1/employees/{code}/summary/`), and overdue report (`GET /api/v1/reports/overdue/`).
+  3. **Automated Test Execution:** Run the test suite (`docker compose exec web pytest -v`) demonstrating all 44 unit, integration, and concurrency tests passing.
+  4. **Technical Narration:** Discuss key design decisions, including database-level concurrency lock ordering (`Employee` row followed by `Asset` row) and Celery notice idempotency.
