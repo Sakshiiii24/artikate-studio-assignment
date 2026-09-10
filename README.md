@@ -71,12 +71,24 @@ Verify system configuration and dependencies:
 python manage.py check
 ```
 
-### 6. Start the Development Server
+### 5. Run Database Migrations
+Apply initial database schema:
+```bash
+python manage.py migrate
+```
+
+### 6. Run Tests
+Verify system tests via pytest:
+```bash
+pytest
+```
+
+### 7. Start the Development Server
 ```bash
 python manage.py runserver
 ```
 
-### 7. Verify Health Endpoint
+### 8. Verify Health Endpoint
 Check that the service is running and reporting database connectivity:
 ```bash
 curl -s http://127.0.0.1:8000/health/
@@ -105,14 +117,17 @@ Expected JSON response when database is connected:
 4. **Timezone Awareness:** Set `USE_TZ = True` with default `TIME_ZONE = 'UTC'` to guarantee timezone-aware timestamps across all models, overdue calculations, and background tasks.
 5. **Health Check Routing:** Mounted at both `/health/` and `/api/v1/health/` so monitoring systems can probe either standard endpoint without authentication.
 6. **Environment Separation:** Configuration follows 12-factor principles using `django-environ`, allowing seamless transitions between local development, testing, and Docker container environments.
+7. **Unique Fields & Indexing:** The specification states `asset_tag` and `employee_code` are unique and indexed. In PostgreSQL and Django, setting `unique=True` on a field inherently creates a unique B-tree index. Specifying `db_index=True` on a unique field is redundant, so `unique=True` was used without an unnecessary duplicate index definition.
+8. **Explicit Database Table Names:** Specified `db_table = 'assets'`, `db_table = 'employees'`, `db_table = 'checkouts'`, and `db_table = 'overdue_notices'` in model `Meta` to match the exact table schema defined in Part C of the assessment specification.
+9. **Notice Uniqueness Constraint:** Enforced via `models.UniqueConstraint(fields=['checkout', 'notice_date'], name='unique_notice_per_checkout_date')` in `Meta.constraints` (modern Django practice preferred over deprecated `unique_together`).
 
 ---
 
 ## 5. Known Gaps
 
-1. **Domain Models Pending:** `Asset`, `Employee`, `CheckOut`, and `OverdueNotice` models are intentionally omitted in this initial foundation commit.
-2. **Database Migrations:** Schema migrations will be created incrementally once the data models and database-level constraints are defined.
-3. **Authentication:** DRF authentication and permission classes are intentionally not yet active across the API.
-4. **Domain Endpoints & Business Logic:** Assets, check-outs, return flow, summary, and overdue reports endpoints are not yet implemented.
+1. **Domain Models & Migrations:** Completed in Stage 2 (`assets/models.py` and migration `0001_initial.py`).
+2. **Authentication:** DRF authentication and permission classes are intentionally not yet active across the API.
+3. **Domain Endpoints & Business Logic:** Assets, check-outs, return flow, summary, and overdue reports endpoints are not yet implemented.
+4. **Checkout Concurrency & Limit Rules:** Database-level locking (`select_for_update`) and employee limit checks to be implemented in the checkouts view/service layer in upcoming stages.
 5. **Celery & Redis:** Asynchronous background task `flag_overdue_checkouts` and Celery Beat scheduler are not yet wired up.
 6. **Docker Stack:** `Dockerfile` and `docker-compose.yml` defining the four services (Django, PostgreSQL, Redis, Celery) will be added in the containerisation phase.
