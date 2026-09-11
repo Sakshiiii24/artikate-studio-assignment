@@ -117,5 +117,5 @@ An hourly background task (`assets.tasks.flag_overdue_checkouts`) scans for acti
 ## Walkthrough Video
 
 - **Link:** [Artikate Assessment Walkthrough (Google Drive)](https://drive.google.com/file/d/1dcSgSxU3q72llo1D3QIlvYsmOY4FDD-n/view?usp=drivesdk)
-- **Duration:** ~6 minutes
+- **Duration:** ~12 minutes
 - **Agenda:** Stack startup via Docker, migration + seed demo, API endpoint walkthrough (checkout, summary stats, overdue report), test suite execution, and technical narration of concurrency locking decisions.
