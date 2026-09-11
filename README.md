@@ -149,7 +149,7 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/artikate_db pytest -v
 ## 6. Screen Recording
 
 Per assessment submission requirements:
-- **Walkthrough Video Link:** `[Link to Screen Recording (Loom / Drive / unlisted link)]`
+- **Walkthrough Video Link:** [Artikate Assessment Walkthrough (Google Drive)](https://drive.google.com/file/d/1dcSgSxU3q72llo1D3QIlvYsmOY4FDD-n/view?usp=drivesdk)
 - **Recording Agenda (6–8 minutes):**
   1. **Stack Initialization:** Bring up the Docker stack (`docker compose up -d`), execute database migrations (`python manage.py migrate`), and seed clean demo data (`python manage.py seed_demo_data`).
   2. **Live Endpoint Demonstration:** Exercise the check-out flow (`POST /api/v1/checkouts/`), employee hold summary (`GET /api/v1/employees/{code}/summary/`), and overdue report (`GET /api/v1/reports/overdue/`).
